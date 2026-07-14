@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Funding harvester scout — read-only ranking of coins by NET-of-costs funding yield.
+"""Funding harvester scout — ранкинг коинов по УСТОЙЧИВОЙ net-of-costs funding yield.
 
-Отвечает на вопрос "почему фармить не по топу funding APR, а по net": сортирует
-рынок по чистой доходности после liquidity-гейта и costs, а не по голому funding.
+Отвечает "почему фармить не по топу funding APR": топ по снапшоту почти всегда
+(a) fail по ликвидности, (b) wrong-side hedge, или (c) СПАЙК — funding-история
+показывает, что среднее держится около нуля/floor, а высокая цифра транзиентна.
 
-СВЕРЕНО С КОДЕКСОМ (использует те же источники/пороги, что и бот):
-  - Данные: публичный POST /info {"type":"metaAndAssetCtxs"}  — ровно как
-    bot/exchange.py:548 (_get_funding_map) и bot/coin_filter.py:79-94.
-    Ключи НЕ нужны (read-only, public endpoint).
-  - Funding часовой (bot/exchange.py:531 "часовой") → APR = funding_hr * 24 * 365.
-  - Liquidity-гейт: MIN_OI_USD=$2M, MIN_VOL_24H_USD=$1M, spread<=0.1%,
-    depth+-0.5%>=$5k  (bot/coin_filter.py:27-31).
-  - Cost: HL taker 0.045%/side => 0.09% RT (CLAUDE.md "HL 0.09%"),
-    slip default 0.1%/side (bot/exchange.py:881 fallback).
+СВЕРЕНО С КОДЕКСОМ (те же источники/пороги, что и бот):
+  - Данные: public POST /info metaAndAssetCtxs  (bot/exchange.py:548, coin_filter.py:79)
+  - Funding часовой (bot/exchange.py:531) -> APR = funding_hr * 24 * 365
+  - История: public POST /info fundingHistory  (тот же info-эндпоинт)
+  - Liquidity: OI>=$2M, vol>=$1M, spread<=0.1%, depth+-0.5%>=$5k (coin_filter.py:27-31)
+  - Cost: taker 0.045%/side => 0.09% RT (CLAUDE.md), slip 0.1%/side (exchange.py:881)
 
-НИЧЕГО НЕ ТОРГУЕТ. Только GET-подобные POST-запросы к публичному info-эндпоинту.
+Cross-venue (Nado/Extended/Pacifica) ТУТ НЕ ТЯНЕТСЯ — org egress-policy режет их
+хосты (403 CONNECT), а bot-клиенты требуют SDK+ключи. Запускать на VPS. Причём
+в самом боте Nado.funding_rate — заглушка return 0.0 (exchange_nado.py:325),
+Extended идёт через x10 SDK, Pacifica-клиент отсутствует => cross-venue funding
+надо сперва реализовать. См. вывод скрипта.
+
+НИЧЕГО НЕ ТОРГУЕТ. Только read-only POST к публичному info-эндпоинту.
 
 Usage:
-  python3 scripts/funding_scan.py                 # main perp dex, OI/Vol gate
-  python3 scripts/funding_scan.py --deep          # + реальный spread/depth из l2Book
-  python3 scripts/funding_scan.py --top 40 --hold 30 --notional 2000
+  python3 scripts/funding_scan.py                       # снапшот, OI/Vol гейт
+  python3 scripts/funding_scan.py --deep                # + реальный spread/depth
+  python3 scripts/funding_scan.py --deep --history 7    # + 7д стабильность funding
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ import time
 try:
     import requests
 except ImportError:
-    sys.exit("requests not installed (pip install requests, либо запусти в venv бота)")
+    sys.exit("requests not installed (pip install requests / venv бота)")
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
 
@@ -41,6 +45,7 @@ MAX_SPREAD_PCT = 0.1         # coin_filter.py:29
 MIN_DEPTH_05_USD = 5_000     # coin_filter.py:30
 HL_TAKER_FEE = 0.00045       # 0.045%/side => 0.09% RT (CLAUDE.md)
 HL_SLIP_DEFAULT = 0.001      # 0.1%/side fallback (exchange.py:881)
+HL_FLOOR_APR = 11.0          # наблюдаемый HL baseline funding (interest component)
 
 
 def _post(payload: dict, timeout: float = 15.0) -> object:
@@ -50,37 +55,29 @@ def _post(payload: dict, timeout: float = 15.0) -> object:
 
 
 def fetch_universe() -> list[dict]:
-    """Возвращает [{name, funding_hr, mark, oi_usd, vol_usd}] для main perp dex."""
     data = _post({"type": "metaAndAssetCtxs"})
     out: list[dict] = []
     if not (isinstance(data, list) and len(data) >= 2):
         return out
-    universe = data[0].get("universe", [])
-    ctxs = data[1]
-    for i, asset in enumerate(universe):
-        if i >= len(ctxs):
+    for i, asset in enumerate(data[0].get("universe", [])):
+        if i >= len(data[1]):
             continue
-        a = ctxs[i]
+        a = data[1][i]
         mark = float(a.get("markPx", 0) or 0)
-        funding_hr = float(a.get("funding", 0) or 0)
-        oi_usd = float(a.get("openInterest", 0) or 0) * mark
-        vol_usd = float(a.get("dayNtlVlm", 0) or 0)
         if mark <= 0:
             continue
         out.append({
             "name": asset["name"],
-            "funding_hr": funding_hr,
+            "funding_hr": float(a.get("funding", 0) or 0),
             "mark": mark,
-            "oi_usd": oi_usd,
-            "vol_usd": vol_usd,
-            "spread_pct": None,
-            "depth_05": None,
+            "oi_usd": float(a.get("openInterest", 0) or 0) * mark,
+            "vol_usd": float(a.get("dayNtlVlm", 0) or 0),
+            "spread_pct": None, "depth_05": None, "hist": None,
         })
     return out
 
 
 def add_book_metrics(coin: dict) -> None:
-    """Заполняет spread_pct + depth_05 из публичного l2Book (как coin_filter._book_metrics)."""
     try:
         book = _post({"type": "l2Book", "coin": coin["name"]}, timeout=10)
         levels = book.get("levels", []) if isinstance(book, dict) else []
@@ -108,10 +105,32 @@ def add_book_metrics(coin: dict) -> None:
         return
 
 
+def add_history(coin: dict, days: float) -> None:
+    """Стабильность funding за окно: avg signed APR, same-side %, n часов."""
+    try:
+        start = int((time.time() - days * 86400) * 1000)
+        h = _post({"type": "fundingHistory", "coin": coin["name"], "startTime": start}, timeout=12)
+        if not isinstance(h, list) or not h:
+            return
+        aprs = [float(x.get("fundingRate", 0)) * 24 * 365 * 100 for x in h]
+        n = len(aprs)
+        now_sign = 1 if coin["funding_hr"] >= 0 else -1
+        avg_signed = sum(aprs) / n
+        same_side = sum(1 for a in aprs if (a >= 0) == (now_sign >= 0)) / n * 100
+        expected_hrs = days * 24
+        coin["hist"] = {
+            "avg_signed": avg_signed,
+            "same_side_pct": same_side,
+            "n": n,
+            "new": n < expected_hrs * 0.5,   # мало истории => новый листинг
+        }
+    except Exception:
+        return
+
+
 def per_side_cost(coin: dict) -> float:
-    """Fee + slip оценка на одну сторону (доля notional)."""
     if coin.get("spread_pct") is not None:
-        slip = max(HL_TAKER_FEE, (coin["spread_pct"] / 100) / 2)  # half-spread as clip proxy
+        slip = max(HL_TAKER_FEE, (coin["spread_pct"] / 100) / 2)
     else:
         slip = HL_SLIP_DEFAULT
     return HL_TAKER_FEE + slip
@@ -127,105 +146,126 @@ def liquidity_pass(coin: dict) -> bool:
     return True
 
 
+def verdict(coin: dict) -> str:
+    """STABLE / FLIP / SPIKE / NEW / — на основе funding-истории."""
+    h = coin.get("hist")
+    if not h:
+        return "—"
+    if h["new"]:
+        return "NEW"          # <50% ожидаемой истории — новый листинг, риск
+    if h["same_side_pct"] < 70:
+        return "FLIP"         # funding часто меняет знак — нельзя статично харвестить
+    snap = abs(coin["apr"])
+    avg = abs(h["avg_signed"])
+    if snap > max(2 * avg, HL_FLOOR_APR + 15):
+        return "SPIKE"        # снапшот сильно выше среднего — транзиент
+    return "STABLE"
+
+
+def harvest_apr(coin: dict) -> float:
+    """Ожидаемая доходность харвеста: если есть история — среднее (signed magnitude),
+    иначе снапшот. Это то, что реально соберёшь за холд, а не пиковая цифра."""
+    h = coin.get("hist")
+    if h and not h["new"]:
+        return abs(h["avg_signed"])
+    return abs(coin["apr"])
+
+
 def enrich(coin: dict, hold_days: float) -> dict:
-    apr = abs(coin["funding_hr"]) * 24 * 365          # harvestable: берём receiving-сторону
+    coin["apr"] = abs(coin["funding_hr"]) * 24 * 365 * 100  # снапшот APR, %
+    coin["side"] = "SHORT-perp" if coin["funding_hr"] > 0 else "LONG-perp"
+    coin["liq"] = liquidity_pass(coin)
+    coin["verdict"] = verdict(coin)
+    hv = harvest_apr(coin)                       # %
     psc = per_side_cost(coin)
-    rt_neutral = 4 * psc                               # 2 ноги x 2 side (delta-neutral open+close)
-    daily = apr / 365
-    breakeven = (rt_neutral / daily) if daily > 0 else float("inf")
-    net_apr = ((apr * hold_days / 365) - rt_neutral) * 365 / hold_days
-    coin.update({
-        "apr": apr,
-        "side": "SHORT-perp" if coin["funding_hr"] > 0 else "LONG-perp",
-        "rt_cost_pct": rt_neutral * 100,
-        "breakeven_days": breakeven,
-        "net_apr": net_apr,
-        "liq": liquidity_pass(coin),
-    })
+    rt_neutral = 4 * psc * 100                    # %  (2 ноги x 2 side)
+    daily = hv / 365
+    coin["rt_cost_pct"] = rt_neutral
+    coin["breakeven_days"] = (rt_neutral / daily) if daily > 0 else float("inf")
+    coin["net_apr"] = ((hv * hold_days / 365) - rt_neutral) * 365 / hold_days
+    coin["hv"] = hv
     return coin
 
 
 def fmt(coin: dict) -> str:
     be = coin["breakeven_days"]
-    be_s = f"{be:6.1f}" if be != float("inf") else "   inf"
+    be_s = f"{be:5.1f}" if be != float("inf") else "  inf"
     sp = f"{coin['spread_pct']:.3f}" if coin.get("spread_pct") is not None else "  -"
-    return (f"{coin['name']:<12} {coin['apr']*100:7.1f}% {coin['side']:<10} "
-            f"{coin['vol_usd']/1e6:8.1f}M {coin['oi_usd']/1e6:7.1f}M {sp:>6} "
-            f"{coin['rt_cost_pct']:5.2f}% {be_s} {coin['net_apr']*100:7.1f}%  "
-            f"{'PASS' if coin['liq'] else 'fail'}")
+    avg = f"{coin['hist']['avg_signed']:6.1f}" if coin.get("hist") else "     -"
+    return (f"{coin['name']:<11} {coin['apr']:6.0f}% {avg:>7} {coin['verdict']:<6} "
+            f"{coin['side']:<10} {coin['vol_usd']/1e6:7.1f}M {sp:>6} "
+            f"{be_s} {coin['net_apr']:6.0f}%  {'PASS' if coin['liq'] else 'fail'}")
 
 
-HEADER = (f"{'coin':<12} {'fundAPR':>8} {'harvest':<10} "
-          f"{'vol24h':>9} {'OI':>8} {'spr%':>6} {'rtCost':>6} {'be_d':>7} {'netAPR30':>8}  liq")
+HEADER = (f"{'coin':<11} {'snapAPR':>7} {'avg7d':>7} {'stab':<6} {'harvest':<10} "
+          f"{'vol24h':>8} {'spr%':>6} {'be_d':>5} {'netAPR':>6}  liq")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--top", type=int, default=30, help="сколько строк показать")
-    ap.add_argument("--hold", type=float, default=30, help="reference hold в днях для net")
-    ap.add_argument("--notional", type=float, default=2000, help="target notional/leg (для будущего size-aware slip)")
-    ap.add_argument("--deep", action="store_true", help="тянуть реальный spread/depth из l2Book (top-N by funding)")
-    ap.add_argument("--watch", nargs="*", default=["HYPE", "FARTCOIN"], help="коины портфеля для сравнения")
+    ap.add_argument("--top", type=int, default=22)
+    ap.add_argument("--hold", type=float, default=30, help="reference hold (дни)")
+    ap.add_argument("--deep", action="store_true", help="реальный spread/depth из l2Book")
+    ap.add_argument("--history", type=float, default=0, help="дней funding-истории для стабильности")
+    ap.add_argument("--watch", nargs="*", default=["HYPE", "FARTCOIN"])
     args = ap.parse_args()
 
     print(f"# Funding scout @ {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime())} "
-          f"| source: HL metaAndAssetCtxs (public) | hold={args.hold}d")
-    t0 = time.time()
+          f"| HL metaAndAssetCtxs (public) | hold={args.hold}d hist={args.history}d")
     coins = fetch_universe()
     if not coins:
-        return _diag("metaAndAssetCtxs вернул пусто/не список")
-    print(f"# universe: {len(coins)} perps | fetch {time.time()-t0:.1f}s")
-
+        print("[!] metaAndAssetCtxs пусто — нет egress к HL?", file=sys.stderr)
+        return 2
+    print(f"# universe: {len(coins)} perps")
     coins.sort(key=lambda c: abs(c["funding_hr"]), reverse=True)
 
+    watch_set = set(args.watch)
+    focus = coins[:args.top] + [c for c in coins[args.top:] if c["name"] in watch_set]
     if args.deep:
-        n = min(args.top, len(coins))
-        watch_set = set(args.watch)
-        deep_targets = coins[:n] + [c for c in coins[n:] if c["name"] in watch_set]
-        print(f"# --deep: тяну l2Book для top-{n} by funding + watch ({len(deep_targets)} coins)...")
-        for c in deep_targets:
-            add_book_metrics(c)
-            time.sleep(0.12)  # rate-limit safe (coin_filter: 0.15s)
+        print(f"# --deep: l2Book для {len(focus)} coins...")
+        for c in focus:
+            add_book_metrics(c); time.sleep(0.12)
+    if args.history:
+        print(f"# --history: {args.history}d funding для {len(focus)} coins...")
+        for c in focus:
+            add_history(c, args.history); time.sleep(0.12)
 
     for c in coins:
         enrich(c, args.hold)
 
-    # --- Раздел 1: топ по ГОЛОМУ funding (то, что соблазняет) ---
-    print("\n== TOP by RAW funding APR (наивный выбор) ==")
+    print("\n== TOP by RAW снапшот funding (наивный выбор) ==")
     print(HEADER)
     for c in coins[:args.top]:
         print(fmt(c))
 
-    # --- Раздел 2: топ по NET среди прошедших liquidity-гейт ---
     liq = [c for c in coins if c["liq"]]
-    liq.sort(key=lambda c: c["net_apr"], reverse=True)
-    print(f"\n== TOP by NET APR@{int(args.hold)}d, только liquidity-PASS ({len(liq)} passed gate) ==")
+    # если есть история — ранкуем по реальной harvest-доходности, иначе по снапшоту
+    key = (lambda c: (c["verdict"] in ("STABLE", "OK", "—"), c["net_apr"])) if args.history \
+        else (lambda c: c["net_apr"])
+    liq.sort(key=key, reverse=True)
+    tag = "по NET (стабильные сверху)" if args.history else "по NET снапшота"
+    print(f"\n== TOP среди liquidity-PASS, {tag} ({len(liq)} прошли гейт) ==")
     print(HEADER)
     for c in liq[:args.top]:
         print(fmt(c))
 
-    # --- Раздел 3: портфельные коины ---
     print("\n== WATCH (текущий портфель) ==")
     print(HEADER)
     by_name = {c["name"]: c for c in coins}
     for w in args.watch:
         c = by_name.get(w)
-        print(fmt(c) if c else f"{w:<12} — нет в universe")
+        print(fmt(c) if c else f"{w:<11} — нет в universe")
 
-    # --- вывод ---
-    if liq:
-        raw_top = coins[0]["name"]
-        net_top = liq[0]["name"]
-        print(f"\n# raw-funding топ = {raw_top} | net-топ (liq-pass) = {net_top}")
-        print("# если raw-топ != net-топ — это и есть ответ 'почему не по топу funding'.")
+    # вывод
+    stable_liq = [c for c in liq if c.get("verdict") == "STABLE"] if args.history else liq
+    print(f"\n# raw-снапшот топ = {coins[0]['name']} ({coins[0]['apr']:.0f}%, {coins[0]['verdict']})")
+    if args.history and stable_liq:
+        best = max(stable_liq, key=lambda c: c["net_apr"])
+        print(f"# лучший СТАБИЛЬНЫЙ liquidity-PASS = {best['name']}: "
+              f"harvest~{best['hv']:.0f}% net~{best['net_apr']:.0f}%")
+        print("# => высокий снапшот-funding != доход: смотри avg7d + stab, а не пик.")
+    print("# cross-venue (Nado/Extended/Pacifica) недостижим отсюда (egress policy) — на VPS.")
     return 0
-
-
-def _diag(msg: str) -> int:
-    print(f"\n[!] {msg}", file=sys.stderr)
-    print("[!] Возможно нет egress к api.hyperliquid.xyz из этой среды.", file=sys.stderr)
-    print("[!] Тогда запусти на VPS: python3 scripts/funding_scan.py --deep", file=sys.stderr)
-    return 2
 
 
 if __name__ == "__main__":
