@@ -66,6 +66,7 @@ ssh kraken-bot      # Snel NL, root direct
 - **`docs/ops.md`** — VPS машины, deploy procedure, scripts, auto_monitor, multiprocessing на Mac, backtest правила
 - **`docs/roadmap.md`** — планы (Xnn, осцилляторы, liquidity cycles), плановые изменения
 - **`docs/rules.md`** — расширенные правила (метрики MM, MM cap, fees & slippage, leverage caps per-bot, copyright, notifications, и т.д.)
+- **`docs/arbitrage.md`** — funding-арбитраж: скан 45 бирж (`scripts/funding_arb_scan.py`), замеры по BTC/ETH/SOL, почему на мажорах спред мал
 
 ## КЛЮЧИ И АДРЕСА
 
